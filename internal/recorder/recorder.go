@@ -1,38 +1,44 @@
 package recorder
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
+	livekit "github.com/livekit/protocol/livekit"
 	lksdk "github.com/livekit/server-sdk-go"
 	"github.com/pion/webrtc/v3"
 
 	"github.com/dasiot-go-livekit-recorder/livekit-recorder/internal/recorder/structs"
 )
 
-// recorderImpl 實現 structs.Recorder 接口
-type recorderImpl struct {
+// Recorder 实现 structs.Recorder 接口
+type Recorder struct {
 	config structs.RecorderConfig
 	room   *lksdk.Room
 	tracks sync.Map
 }
 
-// trackRecorderImpl 實現 structs.TrackRecorder 接口
-type trackRecorderImpl struct {
+// TrackRecorder 实现 structs.TrackRecorder 接口
+type TrackRecorder struct {
 	track               *webrtc.TrackRemote
 	publication         *lksdk.RemoteTrackPublication
 	participantIdentity string
 	stopChan            chan struct{}
+	outputDir           string
+	config              structs.RecorderConfig
 }
 
-// NewRecorderConfig 從環境變量創建一個新的 RecorderConfig
+// NewRecorderConfig 从环境变量创建一个新的 RecorderConfig
 func NewRecorderConfig() (*structs.RecorderConfig, error) {
-	// 加載 .env 文件（如果存在）
+	// 加载 .env 文件（如果存在）
 	_ = godotenv.Load()
 
 	config := &structs.RecorderConfig{
@@ -40,9 +46,15 @@ func NewRecorderConfig() (*structs.RecorderConfig, error) {
 		APIKey:     os.Getenv("LIVEKIT_API_KEY"),
 		APISecret:  os.Getenv("LIVEKIT_API_SECRET"),
 		RoomName:   os.Getenv("LIVEKIT_ROOM_NAME"),
+		OutputDir:  os.Getenv("OUTPUT_DIR"),
 	}
 
-	// 檢查必要的配置是否已設置
+	// 如果没有设置 OUTPUT_DIR，使用默认值
+	if config.OutputDir == "" {
+		config.OutputDir = "/tmp/video"
+	}
+
+	// 检查必要的配置是否已设置
 	if config.LiveKitURL == "" || config.APIKey == "" || config.APISecret == "" || config.RoomName == "" {
 		return nil, fmt.Errorf("missing required configuration")
 	}
@@ -50,16 +62,21 @@ func NewRecorderConfig() (*structs.RecorderConfig, error) {
 	return config, nil
 }
 
-// NewRecorder 創建一個新的錄製器實例
+// NewRecorder 创建一个新的录制器实例
 func NewRecorder(config structs.RecorderConfig) structs.Recorder {
-	return &recorderImpl{
+	return &Recorder{
 		config: config,
 	}
 }
 
-// Start 開始錄製過程
-func (r *recorderImpl) Start() error {
+// Start 开始录制过程
+func (r *Recorder) Start() error {
 	log.Println("Starting the recorder...")
+
+	// 确保输出目录存在
+	if err := os.MkdirAll(r.config.OutputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
 
 	room, err := lksdk.ConnectToRoom(r.config.LiveKitURL, lksdk.ConnectInfo{
 		APIKey:              r.config.APIKey,
@@ -82,7 +99,7 @@ func (r *recorderImpl) Start() error {
 	r.room = room
 	log.Println("Connected to room:", r.config.RoomName)
 
-	// 等待中斷信號
+	// 等待中断信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
@@ -90,88 +107,116 @@ func (r *recorderImpl) Start() error {
 	log.Println("Shutting down recorder...")
 	r.room.Disconnect()
 
+	// 给所有的 track recorder 一些时间来完成关闭操作
+	time.Sleep(2 * time.Second)
+
 	return nil
 }
 
-func (r *recorderImpl) HandleTrackPublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
+func (r *Recorder) HandleTrackPublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log.Printf("Track published: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
 
-	// 訂閱軌道
+	// 订阅轨道
 	err := publication.SetSubscribed(true)
 	if err != nil {
 		log.Printf("Failed to subscribe to track: %v", err)
 	}
 }
 
-func (r *recorderImpl) HandleTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
+func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log.Printf("Track subscribed: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
 
-	recorder := newTrackRecorder(track, publication, rp.Identity())
+	recorder := newTrackRecorder(track, publication, rp.Identity(), r.config.OutputDir, r.config)
 	r.tracks.Store(publication.SID(), recorder)
 	go recorder.Start()
 }
 
-func (r *recorderImpl) HandleTrackUnpublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
+func (r *Recorder) HandleTrackUnpublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log.Printf("Track unpublished: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
 
-	// 停止並移除軌道錄製器
+	// 停止并移除轨道录制器
 	if recorder, ok := r.tracks.Load(publication.SID()); ok {
 		recorder.(structs.TrackRecorder).Stop()
 		r.tracks.Delete(publication.SID())
 	}
 }
 
-func newTrackRecorder(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, participantIdentity string) structs.TrackRecorder {
-	return &trackRecorderImpl{
+func newTrackRecorder(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, participantIdentity string, outputDir string, config structs.RecorderConfig) structs.TrackRecorder {
+	return &TrackRecorder{
 		track:               track,
 		publication:         publication,
 		participantIdentity: participantIdentity,
 		stopChan:            make(chan struct{}),
+		outputDir:           outputDir,
+		config:              config,
 	}
 }
 
-func (tr *trackRecorderImpl) Start() {
+func (tr *TrackRecorder) Start() {
 	log.Printf("Started recording track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 
-	// 创建输出文件
-	filename := fmt.Sprintf("%s_%s.raw", tr.participantIdentity, tr.publication.SID())
-	file, err := os.Create(filename)
+	// 创建 Egress 客户端
+	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
+
+	// 设置输出文件名
+	fileName := fmt.Sprintf("%s_%s_%s.mp4", tr.participantIdentity, tr.publication.SID(), time.Now().Format("20060102_150405"))
+	outputPath := filepath.Join(tr.outputDir, fileName)
+
+	// 创建 TrackEgressRequest
+	req := &livekit.TrackEgressRequest{
+		RoomName: tr.config.RoomName,
+		TrackId:  tr.track.ID(),
+		Output: &livekit.TrackEgressRequest_File{
+			File: &livekit.DirectFileOutput{
+				Filepath: outputPath,
+			},
+		},
+	}
+
+	// 启动 Egress
+	res, err := egressClient.StartTrackEgress(context.Background(), req)
 	if err != nil {
-		log.Printf("Error creating output file: %v", err)
+		log.Printf("Failed to start egress for track %s: %v", tr.publication.SID(), err)
 		return
 	}
-	defer file.Close()
 
-	for {
-		select {
-		case <-tr.stopChan:
-			log.Printf("Stopped recording track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
-			return
-		default:
-			// 读取 RTP 包
-			rtpPacket, _, err := tr.track.ReadRTP()
-			if err != nil {
-				log.Printf("Error reading RTP: %v", err)
-				continue
-			}
+	log.Printf("Egress started for track %s. EgressID: %s", tr.publication.SID(), res.EgressId)
 
-			// 将 RTP 包写入文件
-			_, err = file.Write(rtpPacket.Payload)
-			if err != nil {
-				log.Printf("Error writing to file: %v", err)
-				continue
-			}
+	// 使用 defer 确保在函数退出时尝试停止 Egress
+	defer func() {
+		log.Printf("Attempting to stop egress for track %s", tr.publication.SID())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-			log.Printf("Received RTP packet of size %d from track %s", len(rtpPacket.Payload), tr.publication.SID())
+		_, err := egressClient.StopEgress(ctx, &livekit.StopEgressRequest{
+			EgressId: res.EgressId,
+		})
+		if err != nil {
+			log.Printf("Failed to stop egress for track %s: %v", tr.publication.SID(), err)
+		} else {
+			log.Printf("Successfully stopped egress for track %s", tr.publication.SID())
 		}
+	}()
+
+	// 等待停止信号或错误
+	select {
+	case <-tr.stopChan:
+		log.Printf("Received stop signal for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
+	case <-time.After(24 * time.Hour): // 设置一个最大录制时间，例如 24 小时
+		log.Printf("Maximum recording time reached for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 	}
+
+	log.Printf("Recording ended for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 }
 
-func (tr *trackRecorderImpl) Stop() {
+func (tr *TrackRecorder) Stop() {
+	log.Printf("Stopping recording for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 	close(tr.stopChan)
+	// 给一些时间让 Start 方法完成最后的操作
+	time.Sleep(time.Second)
 }
 
-// Start 函數用於啟動錄製器
+// Start 函数用于启动录制器
 func Start() error {
 	config, err := NewRecorderConfig()
 	if err != nil {

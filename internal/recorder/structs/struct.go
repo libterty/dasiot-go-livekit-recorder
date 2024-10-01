@@ -11,6 +11,7 @@ type RecorderConfig struct {
 	APIKey     string
 	APISecret  string
 	RoomName   string
+	OutputDir  string
 }
 
 // Recorder 接口定義錄製器的方法
