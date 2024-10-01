@@ -17,7 +17,7 @@ This project follows the standard Go project layout as defined in [golang-standa
 Run the project with:
 
 ```
-go run cmd/recorder/main.go
+make run
 ```
 
 More instructions will be added as the project develops.
