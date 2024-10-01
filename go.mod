@@ -1,4 +1,4 @@
-module github.com/yourusername/livekit-recorder
+module github.com/dasiot-go-livekit-recorder/livekit-recorder
 
 go 1.23.1
 

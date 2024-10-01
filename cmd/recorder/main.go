@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/yourusername/livekit-recorder/internal/recorder"
+	"github.com/dasiot-go-livekit-recorder/livekit-recorder/internal/recorder"
 )
 
 func main() {

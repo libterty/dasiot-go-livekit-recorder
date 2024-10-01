@@ -10,7 +10,7 @@ import (
 	lksdk "github.com/livekit/server-sdk-go"
 	"github.com/pion/webrtc/v3"
 
-	"github.com/yourusername/livekit-recorder/internal/recorder/structs"
+	"github.com/dasiot-go-livekit-recorder/livekit-recorder/internal/recorder/structs"
 )
 
 // NewRecorder 創建一個新的錄製器實例
