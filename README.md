@@ -21,3 +21,17 @@ go run cmd/recorder/main.go
 ```
 
 More instructions will be added as the project develops.
+
+## Video Test
+
+```
+// Create a Livekit ingress first
+
+./scripts/stream_to_livekit.sh 2
+
+
+
+// After ingress created, copy create result `rtmp_url` and `stream_key` to env file
+
+./scripts/stream_to_livekit.sh 1 <path-to-your-video-source>
+```
