@@ -3,7 +3,6 @@ package recorder
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -50,6 +49,8 @@ func NewRecorderConfig() (*structs.RecorderConfig, error) {
 	s3Endpoint := os.Getenv("S3_ENDPOINT")
 	s3Endpoint = strings.TrimPrefix(strings.TrimPrefix(s3Endpoint, "https://"), "http://")
 	s3Endpoint = strings.TrimSuffix(s3Endpoint, "/")
+
+	// Remove any path after the domain
 	if idx := strings.Index(s3Endpoint, "/"); idx != -1 {
 		s3Endpoint = s3Endpoint[:idx]
 	}
@@ -72,6 +73,12 @@ func NewRecorderConfig() (*structs.RecorderConfig, error) {
 	}
 
 	return config, nil
+}
+
+// constructS3BaseURL creates the base URL for S3 objects
+func constructS3BaseURL(config *structs.RecorderConfig) string {
+	endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "https://"), "http://")
+	return fmt.Sprintf("https://%s/%s", endpoint, config.S3BucketName)
 }
 
 // NewRecorder creates a new recorder instance
@@ -185,18 +192,25 @@ func newTrackRecorder(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackP
 	}
 }
 
+func constructS3URL(config *structs.RecorderConfig, key string) string {
+	// Ensure the endpoint doesn't have a protocol prefix
+	endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "https://"), "http://")
+
+	// Construct the full URL
+	return fmt.Sprintf("https://%s/%s/%s", endpoint, config.S3BucketName, key)
+}
+
 func (tr *TrackRecorder) Start() {
 	log.Printf("Started recording track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 
 	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
 
-	fileName := fmt.Sprintf("%s_%s_%s.mp4", tr.participantIdentity, tr.publication.SID(), time.Now().Format("20060102_150405"))
+	fileName := fmt.Sprintf("ingress_%s_%s_%s.mp4", tr.participantIdentity, tr.publication.SID(), time.Now().Format("20060102_150405"))
 	s3Key := fmt.Sprintf("livecall/test/%s", fileName)
 
-	// Use the pre-processed S3 endpoint from the config
-	minioEndpoint := tr.config.S3Endpoint
-
-	log.Printf("Using MinIO endpoint: %s", minioEndpoint)
+	// Construct the expected S3 URL for logging purposes
+	expectedS3URL := fmt.Sprintf("https://%s/%s", tr.config.S3Endpoint, s3Key)
+	log.Printf("Expected S3 URL: %s", expectedS3URL)
 
 	req := &livekit.TrackEgressRequest{
 		RoomName: tr.config.RoomName,
@@ -209,7 +223,7 @@ func (tr *TrackRecorder) Start() {
 						AccessKey:      tr.config.S3AccessKey,
 						Secret:         tr.config.S3AccessSecret,
 						Bucket:         tr.config.S3BucketName,
-						Endpoint:       minioEndpoint,
+						Endpoint:       tr.config.S3Endpoint,
 						ForcePathStyle: true,
 						Region:         tr.config.S3Region,
 					},
@@ -218,8 +232,8 @@ func (tr *TrackRecorder) Start() {
 		},
 	}
 
-	log.Printf("Starting egress for track %s with MinIO. Bucket: %s, Key: %s, Endpoint: %s",
-		tr.publication.SID(), tr.config.S3BucketName, s3Key, minioEndpoint)
+	log.Printf("Starting egress for track %s. Bucket: %s, Key: %s, Endpoint: %s",
+		tr.publication.SID(), tr.config.S3BucketName, s3Key, tr.config.S3Endpoint)
 
 	res, err := egressClient.StartTrackEgress(context.Background(), req)
 	if err != nil {
@@ -259,9 +273,9 @@ func (tr *TrackRecorder) Start() {
 						} else if info.Status == livekit.EgressStatus_EGRESS_FAILED {
 							log.Printf("Egress failed for track %s. Error: %s", tr.publication.SID(), info.Error)
 							if strings.Contains(info.Error, "AccessDenied") {
-								log.Printf("MinIO access denied. Please check your credentials and bucket permissions.")
+								log.Printf("S3 access denied. Please check your credentials and bucket permissions.")
 							} else if strings.Contains(info.Error, "NoSuchBucket") {
-								log.Printf("MinIO bucket not found. Please check if the bucket '%s' exists.", tr.config.S3BucketName)
+								log.Printf("S3 bucket not found. Please check if the bucket '%s' exists.", tr.config.S3BucketName)
 							}
 							return
 						} else if info.Status == livekit.EgressStatus_EGRESS_ABORTED {
@@ -274,32 +288,6 @@ func (tr *TrackRecorder) Start() {
 			case <-tr.stopChan:
 				log.Printf("Stop signal received for egress status monitoring of track %s", tr.publication.SID())
 				return
-			}
-		}
-	}()
-
-	// Monitor RTP packets
-	go func() {
-		packetCount := 0
-		for {
-			select {
-			case <-tr.stopChan:
-				log.Printf("Stop signal received for RTP monitoring of track %s", tr.publication.SID())
-				return
-			default:
-				_, _, err := tr.track.ReadRTP()
-				if err != nil {
-					if err == io.EOF {
-						log.Printf("End of stream reached for track %s", tr.publication.SID())
-						return
-					}
-					log.Printf("Error reading RTP for track %s: %v", tr.publication.SID(), err)
-					continue
-				}
-				packetCount++
-				if packetCount%1000 == 0 {
-					log.Printf("Received %d RTP packets for track %s", packetCount, tr.publication.SID())
-				}
 			}
 		}
 	}()
