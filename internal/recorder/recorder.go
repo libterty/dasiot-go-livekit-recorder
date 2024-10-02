@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,20 +43,30 @@ type TrackRecorder struct {
 
 // NewRecorderConfig creates a new RecorderConfig from environment variables
 func NewRecorderConfig() (*structs.RecorderConfig, error) {
+	// Load .env file if it exists
 	_ = godotenv.Load()
+
+	// Load and validate S3 endpoint
+	s3Endpoint := os.Getenv("S3_ENDPOINT")
+	s3Endpoint = strings.TrimPrefix(strings.TrimPrefix(s3Endpoint, "https://"), "http://")
+	s3Endpoint = strings.TrimSuffix(s3Endpoint, "/")
+	if idx := strings.Index(s3Endpoint, "/"); idx != -1 {
+		s3Endpoint = s3Endpoint[:idx]
+	}
 
 	config := &structs.RecorderConfig{
 		LiveKitURL:     os.Getenv("LIVEKIT_URL"),
 		APIKey:         os.Getenv("LIVEKIT_API_KEY"),
 		APISecret:      os.Getenv("LIVEKIT_API_SECRET"),
 		RoomName:       os.Getenv("LIVEKIT_ROOM_NAME"),
-		S3Endpoint:     os.Getenv("S3_ENDPOINT"),
+		S3Endpoint:     s3Endpoint,
 		S3BucketName:   os.Getenv("S3_BUCKET_NAME"),
 		S3AccessKey:    os.Getenv("S3_ACCESS_KEY"),
 		S3AccessSecret: os.Getenv("S3_ACCESS_SECRET"),
 		S3Region:       os.Getenv("S3_REGION"),
 	}
 
+	// Validate required configurations
 	if config.LiveKitURL == "" || config.APIKey == "" || config.APISecret == "" || config.RoomName == "" || config.S3Endpoint == "" || config.S3BucketName == "" {
 		return nil, fmt.Errorf("missing required configuration")
 	}
@@ -98,39 +109,6 @@ func NewRecorder(config structs.RecorderConfig) (structs.Recorder, error) {
 		config:   config,
 		s3Client: s3Client,
 	}, nil
-}
-
-func checkEgressStatus(egressClient *lksdk.EgressClient, egressId string, roomName string) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			listRes, err := egressClient.ListEgress(context.Background(), &livekit.ListEgressRequest{
-				RoomName: roomName,
-			})
-			if err != nil {
-				log.Printf("Error listing egress: %v", err)
-				continue
-			}
-
-			for _, info := range listRes.Items {
-				if info.EgressId == egressId {
-					log.Printf("Egress status: %s", info.Status)
-					if info.Status == livekit.EgressStatus_EGRESS_FAILED {
-						log.Printf("Egress failed. Error: %s", info.Error)
-						return
-					} else if info.Status == livekit.EgressStatus_EGRESS_COMPLETE ||
-						info.Status == livekit.EgressStatus_EGRESS_ABORTED {
-						log.Printf("Egress completed with status: %s", info.Status)
-						return
-					}
-					break
-				}
-			}
-		}
-	}
 }
 
 // Start begins the recording process
@@ -213,7 +191,12 @@ func (tr *TrackRecorder) Start() {
 	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
 
 	fileName := fmt.Sprintf("%s_%s_%s.mp4", tr.participantIdentity, tr.publication.SID(), time.Now().Format("20060102_150405"))
-	s3Key := fmt.Sprintf("recordings/%s", fileName)
+	s3Key := fmt.Sprintf("livecall/test/%s", fileName)
+
+	// Use the pre-processed S3 endpoint from the config
+	minioEndpoint := tr.config.S3Endpoint
+
+	log.Printf("Using MinIO endpoint: %s", minioEndpoint)
 
 	req := &livekit.TrackEgressRequest{
 		RoomName: tr.config.RoomName,
@@ -223,18 +206,21 @@ func (tr *TrackRecorder) Start() {
 				Filepath: s3Key,
 				Output: &livekit.DirectFileOutput_S3{
 					S3: &livekit.S3Upload{
-						AccessKey: tr.config.S3AccessKey,
-						Secret:    tr.config.S3AccessSecret,
-						Bucket:    tr.config.S3BucketName,
-						Endpoint:  tr.config.S3Endpoint,
-						Region:    tr.config.S3Region,
+						AccessKey:      tr.config.S3AccessKey,
+						Secret:         tr.config.S3AccessSecret,
+						Bucket:         tr.config.S3BucketName,
+						Endpoint:       minioEndpoint,
+						ForcePathStyle: true,
+						Region:         tr.config.S3Region,
 					},
 				},
 			},
 		},
 	}
 
-	log.Printf("Starting egress for track %s with S3 Key: %s", tr.publication.SID(), s3Key)
+	log.Printf("Starting egress for track %s with MinIO. Bucket: %s, Key: %s, Endpoint: %s",
+		tr.publication.SID(), tr.config.S3BucketName, s3Key, minioEndpoint)
+
 	res, err := egressClient.StartTrackEgress(context.Background(), req)
 	if err != nil {
 		log.Printf("Failed to start egress for track %s: %v", tr.publication.SID(), err)
@@ -243,7 +229,9 @@ func (tr *TrackRecorder) Start() {
 
 	log.Printf("Egress started successfully for track %s. EgressID: %s", tr.publication.SID(), res.EgressId)
 
-	// 启动 Egress 状态监控
+	var lastKnownStatus livekit.EgressStatus
+
+	// Start Egress status monitoring
 	egressDone := make(chan struct{})
 	go func() {
 		defer close(egressDone)
@@ -263,12 +251,18 @@ func (tr *TrackRecorder) Start() {
 
 				for _, info := range listRes.Items {
 					if info.EgressId == res.EgressId {
+						lastKnownStatus = info.Status
 						log.Printf("Egress status for track %s: %s", tr.publication.SID(), info.Status)
 						if info.Status == livekit.EgressStatus_EGRESS_COMPLETE {
 							log.Printf("Egress completed successfully for track %s", tr.publication.SID())
 							return
 						} else if info.Status == livekit.EgressStatus_EGRESS_FAILED {
 							log.Printf("Egress failed for track %s. Error: %s", tr.publication.SID(), info.Error)
+							if strings.Contains(info.Error, "AccessDenied") {
+								log.Printf("MinIO access denied. Please check your credentials and bucket permissions.")
+							} else if strings.Contains(info.Error, "NoSuchBucket") {
+								log.Printf("MinIO bucket not found. Please check if the bucket '%s' exists.", tr.config.S3BucketName)
+							}
 							return
 						} else if info.Status == livekit.EgressStatus_EGRESS_ABORTED {
 							log.Printf("Egress aborted for track %s", tr.publication.SID())
@@ -284,7 +278,7 @@ func (tr *TrackRecorder) Start() {
 		}
 	}()
 
-	// 监控 RTP 包
+	// Monitor RTP packets
 	go func() {
 		packetCount := 0
 		for {
@@ -310,7 +304,7 @@ func (tr *TrackRecorder) Start() {
 		}
 	}()
 
-	// 等待录制结束
+	// Wait for recording to end
 	select {
 	case <-tr.stopChan:
 		log.Printf("Received stop signal for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
@@ -320,18 +314,24 @@ func (tr *TrackRecorder) Start() {
 		log.Printf("Maximum recording time reached for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 	}
 
-	// 停止 Egress
-	log.Printf("Attempting to stop egress for track %s", tr.publication.SID())
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Stop Egress if it's still running
+	if lastKnownStatus != livekit.EgressStatus_EGRESS_COMPLETE &&
+		lastKnownStatus != livekit.EgressStatus_EGRESS_FAILED &&
+		lastKnownStatus != livekit.EgressStatus_EGRESS_ABORTED {
+		log.Printf("Attempting to stop egress for track %s", tr.publication.SID())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-	_, err = egressClient.StopEgress(ctx, &livekit.StopEgressRequest{
-		EgressId: res.EgressId,
-	})
-	if err != nil {
-		log.Printf("Failed to stop egress for track %s: %v", tr.publication.SID(), err)
+		_, err = egressClient.StopEgress(ctx, &livekit.StopEgressRequest{
+			EgressId: res.EgressId,
+		})
+		if err != nil {
+			log.Printf("Failed to stop egress for track %s: %v", tr.publication.SID(), err)
+		} else {
+			log.Printf("Successfully stopped egress for track %s", tr.publication.SID())
+		}
 	} else {
-		log.Printf("Successfully stopped egress for track %s", tr.publication.SID())
+		log.Printf("Egress for track %s already finished with status: %s. No need to stop.", tr.publication.SID(), lastKnownStatus)
 	}
 
 	log.Printf("Recording ended for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
