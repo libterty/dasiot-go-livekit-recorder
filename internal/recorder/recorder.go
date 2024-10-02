@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	livekit "github.com/livekit/protocol/livekit"
 	lksdk "github.com/livekit/server-sdk-go"
 	"github.com/pion/webrtc/v3"
+	"github.com/shirou/gopsutil/cpu"
 
 	"github.com/dasiot-go-livekit-recorder/livekit-recorder/internal/recorder/structs"
 )
@@ -191,14 +193,6 @@ func newTrackRecorder(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackP
 	}
 }
 
-func constructS3URL(config *structs.RecorderConfig, key string) string {
-	// Ensure the endpoint doesn't have a protocol prefix
-	endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "https://"), "http://")
-
-	// Construct the full URL
-	return fmt.Sprintf("https://%s/%s/%s", endpoint, config.S3BucketName, key)
-}
-
 func (tr *TrackRecorder) Start() {
 	log.Printf("Started recording track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 
@@ -266,6 +260,10 @@ func (tr *TrackRecorder) Start() {
 					if info.EgressId == res.EgressId {
 						lastKnownStatus = info.Status
 						log.Printf("Egress status for track %s: %s", tr.publication.SID(), info.Status)
+
+						// Log CPU and Memory usage
+						tr.logResourceUsage()
+
 						if info.Status == livekit.EgressStatus_EGRESS_COMPLETE {
 							log.Printf("Egress completed successfully for track %s", tr.publication.SID())
 							return
@@ -322,6 +320,29 @@ func (tr *TrackRecorder) Start() {
 	}
 
 	log.Printf("Recording ended for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
+}
+
+func (tr *TrackRecorder) logResourceUsage() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	cpuPercent, err := cpu.Percent(0, false)
+	if err != nil {
+		log.Printf("Error getting CPU usage: %v", err)
+		return
+	}
+
+	log.Printf("Resource usage for track %s: CPU: %.2f%%, Memory: Alloc = %v MiB, TotalAlloc = %v MiB, Sys = %v MiB, NumGC = %v",
+		tr.publication.SID(),
+		cpuPercent[0],
+		bToMb(m.Alloc),
+		bToMb(m.TotalAlloc),
+		bToMb(m.Sys),
+		m.NumGC)
+}
+
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
 }
 
 func (tr *TrackRecorder) Stop() {
