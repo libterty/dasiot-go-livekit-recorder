@@ -103,10 +103,9 @@ func NewRecorder(config structs.RecorderConfig) (structs.Recorder, error) {
 		RetryMode:        aws.RetryModeStandard,
 	}
 
-	// 禁用 S3 特定的默认行为
 	options := []func(*s3.Options){
 		func(o *s3.Options) {
-			o.UsePathStyle = true // 对 MinIO 很重要
+			o.UsePathStyle = true // Very important for minio
 		},
 	}
 

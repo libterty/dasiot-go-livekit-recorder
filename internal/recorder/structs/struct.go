@@ -5,7 +5,7 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-// RecorderConfig 包含錄製器的配置
+// RecorderConfig config from env
 type RecorderConfig struct {
 	LiveKitURL     string
 	APIKey         string
@@ -19,7 +19,7 @@ type RecorderConfig struct {
 	S3Region       string
 }
 
-// Recorder 接口定義錄製器的方法
+// Recorder impl
 type Recorder interface {
 	Start() error
 	HandleTrackPublished(*lksdk.RemoteTrackPublication, *lksdk.RemoteParticipant)
@@ -27,7 +27,7 @@ type Recorder interface {
 	HandleTrackUnpublished(*lksdk.RemoteTrackPublication, *lksdk.RemoteParticipant)
 }
 
-// TrackRecorder 接口定義軌道錄製器的方法
+// TrackRecorder impl
 type TrackRecorder interface {
 	Start()
 	Stop()
