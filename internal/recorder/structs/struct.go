@@ -7,11 +7,16 @@ import (
 
 // RecorderConfig 包含錄製器的配置
 type RecorderConfig struct {
-	LiveKitURL string
-	APIKey     string
-	APISecret  string
-	RoomName   string
-	OutputDir  string
+	LiveKitURL     string
+	APIKey         string
+	APISecret      string
+	RoomName       string
+	OutputDir      string
+	S3Endpoint     string
+	S3BucketName   string
+	S3AccessKey    string
+	S3AccessSecret string
+	S3Region       string
 }
 
 // Recorder 接口定義錄製器的方法
