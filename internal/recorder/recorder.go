@@ -24,7 +24,6 @@ import (
 	"github.com/dasiot-go-livekit-recorder/livekit-recorder/internal/recorder/structs"
 )
 
-// Recorder implements structs.Recorder interface
 type Recorder struct {
 	config   structs.RecorderConfig
 	room     *lksdk.Room
@@ -32,29 +31,20 @@ type Recorder struct {
 	s3Client *s3.Client
 }
 
-// TrackRecorder implements structs.TrackRecorder interface
 type TrackRecorder struct {
-	track               *webrtc.TrackRemote
-	publication         *lksdk.RemoteTrackPublication
+	audioTrack          *webrtc.TrackRemote
+	videoTrack          *webrtc.TrackRemote
+	audioPublication    *lksdk.RemoteTrackPublication
+	videoPublication    *lksdk.RemoteTrackPublication
 	participantIdentity string
 	stopChan            chan struct{}
 	config              structs.RecorderConfig
 	s3Client            *s3.Client
 }
 
-// NewRecorderConfig creates a new RecorderConfig from environment variables
 func NewRecorderConfig() (*structs.RecorderConfig, error) {
-	// Load .env file if it exists
-	_ = godotenv.Load()
-
-	// Load and validate S3 endpoint
-	s3Endpoint := os.Getenv("S3_ENDPOINT")
-	s3Endpoint = strings.TrimPrefix(strings.TrimPrefix(s3Endpoint, "https://"), "http://")
-	s3Endpoint = strings.TrimSuffix(s3Endpoint, "/")
-
-	// Remove any path after the domain
-	if idx := strings.Index(s3Endpoint, "/"); idx != -1 {
-		s3Endpoint = s3Endpoint[:idx]
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found")
 	}
 
 	config := &structs.RecorderConfig{
@@ -62,30 +52,22 @@ func NewRecorderConfig() (*structs.RecorderConfig, error) {
 		APIKey:         os.Getenv("LIVEKIT_API_KEY"),
 		APISecret:      os.Getenv("LIVEKIT_API_SECRET"),
 		RoomName:       os.Getenv("LIVEKIT_ROOM_NAME"),
-		S3Endpoint:     s3Endpoint,
+		S3Endpoint:     os.Getenv("S3_ENDPOINT"),
 		S3BucketName:   os.Getenv("S3_BUCKET_NAME"),
 		S3AccessKey:    os.Getenv("S3_ACCESS_KEY"),
 		S3AccessSecret: os.Getenv("S3_ACCESS_SECRET"),
 		S3Region:       os.Getenv("S3_REGION"),
 	}
 
-	// Validate required configurations
-	if config.LiveKitURL == "" || config.APIKey == "" || config.APISecret == "" || config.RoomName == "" || config.S3Endpoint == "" || config.S3BucketName == "" {
+	if config.LiveKitURL == "" || config.APIKey == "" || config.APISecret == "" || config.RoomName == "" ||
+		config.S3Endpoint == "" || config.S3BucketName == "" || config.S3AccessKey == "" || config.S3AccessSecret == "" {
 		return nil, fmt.Errorf("missing required configuration")
 	}
 
 	return config, nil
 }
 
-// constructS3BaseURL creates the base URL for S3 objects
-func constructS3BaseURL(config *structs.RecorderConfig) string {
-	endpoint := strings.TrimPrefix(strings.TrimPrefix(config.S3Endpoint, "https://"), "http://")
-	return fmt.Sprintf("https://%s/%s", endpoint, config.S3BucketName)
-}
-
-// NewRecorder creates a new recorder instance
-func NewRecorder(config structs.RecorderConfig) (structs.Recorder, error) {
-	// Create a custom S3 client using the provided endpoint
+func NewRecorder(config structs.RecorderConfig) (*Recorder, error) {
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{
 			URL:           config.S3Endpoint,
@@ -100,18 +82,12 @@ func NewRecorder(config structs.RecorderConfig) (structs.Recorder, error) {
 			config.S3AccessSecret,
 			"",
 		),
-		Region:           config.S3Region,
-		RetryMaxAttempts: 3,
-		RetryMode:        aws.RetryModeStandard,
+		Region: config.S3Region,
 	}
 
-	options := []func(*s3.Options){
-		func(o *s3.Options) {
-			o.UsePathStyle = true // Very important for minio
-		},
-	}
-
-	s3Client := s3.NewFromConfig(s3Config, options...)
+	s3Client := s3.NewFromConfig(s3Config, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 
 	return &Recorder{
 		config:   config,
@@ -119,7 +95,6 @@ func NewRecorder(config structs.RecorderConfig) (structs.Recorder, error) {
 	}, nil
 }
 
-// Start begins the recording process
 func (r *Recorder) Start() error {
 	log.Println("Starting the recorder...")
 
@@ -151,8 +126,6 @@ func (r *Recorder) Start() error {
 	log.Println("Shutting down recorder...")
 	r.room.Disconnect()
 
-	time.Sleep(2 * time.Second)
-
 	return nil
 }
 
@@ -168,24 +141,45 @@ func (r *Recorder) HandleTrackPublished(publication *lksdk.RemoteTrackPublicatio
 func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log.Printf("Track subscribed: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
 
-	recorder := newTrackRecorder(track, publication, rp.Identity(), r.config, r.s3Client)
-	r.tracks.Store(publication.SID(), recorder)
-	go recorder.Start()
+	key := rp.Identity()
+	value, loaded := r.tracks.Load(key)
+	if loaded {
+		recorder := value.(*TrackRecorder)
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			recorder.audioTrack = track
+			recorder.audioPublication = publication
+		} else if track.Kind() == webrtc.RTPCodecTypeVideo {
+			recorder.videoTrack = track
+			recorder.videoPublication = publication
+		}
+		if recorder.audioTrack != nil && recorder.videoTrack != nil {
+			go recorder.Start()
+		}
+	} else {
+		recorder := newTrackRecorder(rp.Identity(), r.config, r.s3Client)
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			recorder.audioTrack = track
+			recorder.audioPublication = publication
+		} else if track.Kind() == webrtc.RTPCodecTypeVideo {
+			recorder.videoTrack = track
+			recorder.videoPublication = publication
+		}
+		r.tracks.Store(key, recorder)
+	}
 }
 
 func (r *Recorder) HandleTrackUnpublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log.Printf("Track unpublished: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
 
-	if recorder, ok := r.tracks.Load(publication.SID()); ok {
-		recorder.(structs.TrackRecorder).Stop()
-		r.tracks.Delete(publication.SID())
+	key := rp.Identity()
+	if recorder, ok := r.tracks.Load(key); ok {
+		recorder.(*TrackRecorder).Stop()
+		r.tracks.Delete(key)
 	}
 }
 
-func newTrackRecorder(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client) structs.TrackRecorder {
+func newTrackRecorder(participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client) *TrackRecorder {
 	return &TrackRecorder{
-		track:               track,
-		publication:         publication,
 		participantIdentity: participantIdentity,
 		stopChan:            make(chan struct{}),
 		config:              config,
@@ -194,24 +188,29 @@ func newTrackRecorder(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackP
 }
 
 func (tr *TrackRecorder) Start() {
-	log.Printf("Started recording track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
+	if tr.audioTrack == nil || tr.videoTrack == nil {
+		log.Printf("Cannot start recording for participant %s: missing audio or video track", tr.participantIdentity)
+		return
+	}
+
+	log.Printf("Started recording tracks for participant %s", tr.participantIdentity)
 
 	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
 
-	fileName := fmt.Sprintf("ingress_%s_%s_%s.mp4", tr.participantIdentity, tr.publication.SID(), time.Now().Format("20060102_150405"))
+	fileName := fmt.Sprintf("ingress_%s_%s.mp4", tr.participantIdentity, time.Now().Format("20060102_150405"))
 	s3Key := fmt.Sprintf("livecall/test/%s", fileName)
 
-	// Construct the expected S3 URL for logging purposes
 	expectedS3URL := fmt.Sprintf("https://%s/%s", tr.config.S3Endpoint, s3Key)
 	log.Printf("Expected S3 URL: %s", expectedS3URL)
 
-	req := &livekit.TrackEgressRequest{
-		RoomName: tr.config.RoomName,
-		TrackId:  tr.track.ID(),
-		Output: &livekit.TrackEgressRequest_File{
-			File: &livekit.DirectFileOutput{
+	req := &livekit.TrackCompositeEgressRequest{
+		RoomName:     tr.config.RoomName,
+		AudioTrackId: tr.audioTrack.ID(),
+		VideoTrackId: tr.videoTrack.ID(),
+		Output: &livekit.TrackCompositeEgressRequest_File{
+			File: &livekit.EncodedFileOutput{
 				Filepath: s3Key,
-				Output: &livekit.DirectFileOutput_S3{
+				Output: &livekit.EncodedFileOutput_S3{
 					S3: &livekit.S3Upload{
 						AccessKey:      tr.config.S3AccessKey,
 						Secret:         tr.config.S3AccessSecret,
@@ -225,23 +224,21 @@ func (tr *TrackRecorder) Start() {
 		},
 	}
 
-	log.Printf("Starting egress for track %s. Bucket: %s, Key: %s, Endpoint: %s",
-		tr.publication.SID(), tr.config.S3BucketName, s3Key, tr.config.S3Endpoint)
+	log.Printf("Starting egress for participant %s. Bucket: %s, Key: %s, Endpoint: %s",
+		tr.participantIdentity, tr.config.S3BucketName, s3Key, tr.config.S3Endpoint)
 
-	res, err := egressClient.StartTrackEgress(context.Background(), req)
+	res, err := egressClient.StartTrackCompositeEgress(context.Background(), req)
 	if err != nil {
-		log.Printf("Failed to start egress for track %s: %v", tr.publication.SID(), err)
+		log.Printf("Failed to start egress for participant %s: %v", tr.participantIdentity, err)
 		return
 	}
 
-	log.Printf("Egress started successfully for track %s. EgressID: %s", tr.publication.SID(), res.EgressId)
+	log.Printf("Egress started successfully for participant %s. EgressID: %s", tr.participantIdentity, res.EgressId)
 
 	var lastKnownStatus livekit.EgressStatus
 
 	// Start Egress status monitoring
-	egressDone := make(chan struct{})
 	go func() {
-		defer close(egressDone)
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
@@ -252,23 +249,23 @@ func (tr *TrackRecorder) Start() {
 					RoomName: tr.config.RoomName,
 				})
 				if err != nil {
-					log.Printf("Error listing egress for track %s: %v", tr.publication.SID(), err)
+					log.Printf("Error listing egress for participant %s: %v", tr.participantIdentity, err)
 					continue
 				}
 
 				for _, info := range listRes.Items {
 					if info.EgressId == res.EgressId {
 						lastKnownStatus = info.Status
-						log.Printf("Egress status for track %s: %s", tr.publication.SID(), info.Status)
+						log.Printf("Egress status for participant %s: %s", tr.participantIdentity, info.Status)
 
 						// Log CPU and Memory usage
 						tr.logResourceUsage()
 
 						if info.Status == livekit.EgressStatus_EGRESS_COMPLETE {
-							log.Printf("Egress completed successfully for track %s", tr.publication.SID())
+							log.Printf("Egress completed successfully for participant %s", tr.participantIdentity)
 							return
 						} else if info.Status == livekit.EgressStatus_EGRESS_FAILED {
-							log.Printf("Egress failed for track %s. Error: %s", tr.publication.SID(), info.Error)
+							log.Printf("Egress failed for participant %s. Error: %s", tr.participantIdentity, info.Error)
 							if strings.Contains(info.Error, "AccessDenied") {
 								log.Printf("S3 access denied. Please check your credentials and bucket permissions.")
 							} else if strings.Contains(info.Error, "NoSuchBucket") {
@@ -276,50 +273,40 @@ func (tr *TrackRecorder) Start() {
 							}
 							return
 						} else if info.Status == livekit.EgressStatus_EGRESS_ABORTED {
-							log.Printf("Egress aborted for track %s", tr.publication.SID())
+							log.Printf("Egress aborted for participant %s", tr.participantIdentity)
 							return
 						}
 						break
 					}
 				}
+
+				// Check if we need to stop the egress based on lastKnownStatus
+				if lastKnownStatus == livekit.EgressStatus_EGRESS_COMPLETE ||
+					lastKnownStatus == livekit.EgressStatus_EGRESS_FAILED ||
+					lastKnownStatus == livekit.EgressStatus_EGRESS_ABORTED {
+					log.Printf("Stopping egress monitoring for participant %s due to terminal state: %s", tr.participantIdentity, lastKnownStatus)
+					return
+				}
+
 			case <-tr.stopChan:
-				log.Printf("Stop signal received for egress status monitoring of track %s", tr.publication.SID())
+				log.Printf("Stop signal received for egress status monitoring of participant %s", tr.participantIdentity)
+				// Attempt to stop the egress if it's still running
+				if lastKnownStatus != livekit.EgressStatus_EGRESS_COMPLETE &&
+					lastKnownStatus != livekit.EgressStatus_EGRESS_FAILED &&
+					lastKnownStatus != livekit.EgressStatus_EGRESS_ABORTED {
+					_, err := egressClient.StopEgress(context.Background(), &livekit.StopEgressRequest{
+						EgressId: res.EgressId,
+					})
+					if err != nil {
+						log.Printf("Failed to stop egress for participant %s: %v", tr.participantIdentity, err)
+					} else {
+						log.Printf("Successfully stopped egress for participant %s", tr.participantIdentity)
+					}
+				}
 				return
 			}
 		}
 	}()
-
-	// Wait for recording to end
-	select {
-	case <-tr.stopChan:
-		log.Printf("Received stop signal for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
-	case <-egressDone:
-		log.Printf("Egress process completed for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
-	case <-time.After(24 * time.Hour):
-		log.Printf("Maximum recording time reached for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
-	}
-
-	// Stop Egress if it's still running
-	if lastKnownStatus != livekit.EgressStatus_EGRESS_COMPLETE &&
-		lastKnownStatus != livekit.EgressStatus_EGRESS_FAILED &&
-		lastKnownStatus != livekit.EgressStatus_EGRESS_ABORTED {
-		log.Printf("Attempting to stop egress for track %s", tr.publication.SID())
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		_, err = egressClient.StopEgress(ctx, &livekit.StopEgressRequest{
-			EgressId: res.EgressId,
-		})
-		if err != nil {
-			log.Printf("Failed to stop egress for track %s: %v", tr.publication.SID(), err)
-		} else {
-			log.Printf("Successfully stopped egress for track %s", tr.publication.SID())
-		}
-	} else {
-		log.Printf("Egress for track %s already finished with status: %s. No need to stop.", tr.publication.SID(), lastKnownStatus)
-	}
-
-	log.Printf("Recording ended for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
 }
 
 func (tr *TrackRecorder) logResourceUsage() {
@@ -332,8 +319,8 @@ func (tr *TrackRecorder) logResourceUsage() {
 		return
 	}
 
-	log.Printf("Resource usage for track %s: CPU: %.2f%%, Memory: Alloc = %v MiB, TotalAlloc = %v MiB, Sys = %v MiB, NumGC = %v",
-		tr.publication.SID(),
+	log.Printf("Resource usage for participant %s: CPU: %.2f%%, Memory: Alloc = %v MiB, TotalAlloc = %v MiB, Sys = %v MiB, NumGC = %v",
+		tr.participantIdentity,
 		cpuPercent[0],
 		bToMb(m.Alloc),
 		bToMb(m.TotalAlloc),
@@ -346,12 +333,10 @@ func bToMb(b uint64) uint64 {
 }
 
 func (tr *TrackRecorder) Stop() {
-	log.Printf("Stopping recording for track %s from participant %s", tr.publication.SID(), tr.participantIdentity)
+	log.Printf("Stopping recording for participant %s", tr.participantIdentity)
 	close(tr.stopChan)
-	time.Sleep(time.Second)
 }
 
-// Start function to start the recorder
 func Start() error {
 	config, err := NewRecorderConfig()
 	if err != nil {
