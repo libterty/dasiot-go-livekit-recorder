@@ -25,17 +25,20 @@ import (
 )
 
 type Recorder struct {
-	config   structs.RecorderConfig
-	room     *lksdk.Room
-	tracks   sync.Map
-	s3Client *s3.Client
+	config        structs.RecorderConfig
+	rooms         map[string]*lksdk.Room
+	tracks        sync.Map
+	participants  sync.Map // map[string]string to store participantIdentity -> roomName
+	s3Client      *s3.Client
+	livekitClient *lksdk.RoomServiceClient
+	mu            sync.RWMutex
 }
-
 type TrackRecorder struct {
 	audioTrack          *webrtc.TrackRemote
 	videoTrack          *webrtc.TrackRemote
 	audioPublication    *lksdk.RemoteTrackPublication
 	videoPublication    *lksdk.RemoteTrackPublication
+	roomName            string
 	participantIdentity string
 	stopChan            chan struct{}
 	config              structs.RecorderConfig
@@ -89,59 +92,153 @@ func NewRecorder(config structs.RecorderConfig) (*Recorder, error) {
 		o.UsePathStyle = true
 	})
 
+	livekitClient := lksdk.NewRoomServiceClient(config.LiveKitURL, config.APIKey, config.APISecret)
+
 	return &Recorder{
-		config:   config,
-		s3Client: s3Client,
+		config:        config,
+		rooms:         make(map[string]*lksdk.Room),
+		s3Client:      s3Client,
+		livekitClient: livekitClient,
 	}, nil
 }
 
 func (r *Recorder) Start() error {
 	log.Println("Starting the recorder...")
 
-	room, err := lksdk.ConnectToRoom(r.config.LiveKitURL, lksdk.ConnectInfo{
-		APIKey:              r.config.APIKey,
-		APISecret:           r.config.APISecret,
-		RoomName:            r.config.RoomName,
-		ParticipantIdentity: "recorder",
-		ParticipantName:     "Recorder Bot",
-	}, &lksdk.RoomCallback{
-		ParticipantCallback: lksdk.ParticipantCallback{
-			OnTrackPublished:   r.HandleTrackPublished,
-			OnTrackUnpublished: r.HandleTrackUnpublished,
-			OnTrackSubscribed:  r.HandleTrackSubscribed,
-		},
-	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
+	// List all rooms at startup
+	rooms, err := r.livekitClient.ListRooms(ctx, &livekit.ListRoomsRequest{})
 	if err != nil {
-		return fmt.Errorf("failed to connect to room: %v", err)
+		return fmt.Errorf("failed to list rooms: %v", err)
 	}
 
-	r.room = room
-	log.Println("Connected to room:", r.config.RoomName)
+	log.Printf("Found %d existing rooms", len(rooms.Rooms))
+
+	// Use a map to keep track of rooms we've already connected to
+	connectedRooms := make(map[string]bool)
+
+	// Connect to all existing rooms
+	for _, room := range rooms.Rooms {
+		if err := r.connectToRoomIfNotConnected(room.Name, connectedRooms); err != nil {
+			log.Printf("Error connecting to room %s: %v", room.Name, err)
+			// Continue with other rooms even if one fails
+		}
+	}
+
+	// Start monitoring for new rooms
+	go r.monitorNewRooms(ctx, connectedRooms)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
 	log.Println("Shutting down recorder...")
-	r.room.Disconnect()
+	r.disconnectAllRooms()
 
 	return nil
 }
 
+func (r *Recorder) connectToRoomIfNotConnected(roomName string, connectedRooms map[string]bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if connectedRooms[roomName] {
+		log.Printf("Already connected to room: %s, skipping", roomName)
+		return nil
+	}
+
+	log.Printf("Connecting to room: %s", roomName)
+
+	room, err := lksdk.ConnectToRoom(r.config.LiveKitURL, lksdk.ConnectInfo{
+		APIKey:              r.config.APIKey,
+		APISecret:           r.config.APISecret,
+		RoomName:            roomName,
+		ParticipantIdentity: fmt.Sprintf("recorder-%s", roomName),
+		ParticipantName:     fmt.Sprintf("Recorder Bot - %s", roomName),
+	}, &lksdk.RoomCallback{
+		ParticipantCallback: lksdk.ParticipantCallback{
+			OnTrackPublished:   r.HandleTrackPublished,
+			OnTrackUnpublished: r.HandleTrackUnpublished,
+			OnTrackSubscribed:  r.HandleTrackSubscribed,
+		},
+		OnParticipantConnected: func(participant *lksdk.RemoteParticipant) {
+			r.participants.Store(participant.Identity(), roomName)
+		},
+		OnParticipantDisconnected: func(participant *lksdk.RemoteParticipant) {
+			r.participants.Delete(participant.Identity())
+		},
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to connect to room %s: %v", roomName, err)
+	}
+
+	r.rooms[roomName] = room
+	connectedRooms[roomName] = true
+
+	log.Printf("Successfully connected to room: %s", roomName)
+	return nil
+}
+
+func (r *Recorder) monitorNewRooms(ctx context.Context, connectedRooms map[string]bool) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rooms, err := r.livekitClient.ListRooms(ctx, &livekit.ListRoomsRequest{})
+			if err != nil {
+				log.Printf("Failed to list rooms: %v", err)
+				continue
+			}
+
+			for _, room := range rooms.Rooms {
+				if err := r.connectToRoomIfNotConnected(room.Name, connectedRooms); err != nil {
+					log.Printf("Error connecting to new room %s: %v", room.Name, err)
+				}
+			}
+		}
+	}
+}
+
+func (r *Recorder) disconnectAllRooms() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, room := range r.rooms {
+		room.Disconnect()
+	}
+}
+
 func (r *Recorder) HandleTrackPublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-	log.Printf("Track published: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
+	roomName, ok := r.participants.Load(rp.Identity())
+	if !ok {
+		log.Printf("Warning: Room not found for participant %s in HandleTrackPublished", rp.Identity())
+		return
+	}
+	log.Printf("Track published in room %s: %s (%s) from participant %s", roomName, publication.SID(), publication.Kind(), rp.Identity())
 
 	err := publication.SetSubscribed(true)
 	if err != nil {
-		log.Printf("Failed to subscribe to track: %v", err)
+		log.Printf("Failed to subscribe to track in room %s: %v", roomName, err)
 	}
 }
 
 func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-	log.Printf("Track subscribed: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
+	roomName, ok := r.participants.Load(rp.Identity())
+	if !ok {
+		log.Printf("Warning: Room not found for participant %s in HandleTrackSubscribed", rp.Identity())
+		return
+	}
+	roomNameStr := roomName.(string)
+	log.Printf("Track subscribed in room %s: %s (%s) from participant %s", roomNameStr, publication.SID(), publication.Kind(), rp.Identity())
 
-	key := rp.Identity()
+	key := fmt.Sprintf("%s-%s", roomNameStr, rp.Identity())
 	value, loaded := r.tracks.Load(key)
 	if loaded {
 		recorder := value.(*TrackRecorder)
@@ -157,7 +254,7 @@ func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication 
 			go recorder.Start()
 		}
 	} else {
-		recorder := newTrackRecorder(rp.Identity(), r.config, r.s3Client)
+		recorder := newTrackRecorder(roomNameStr, rp.Identity(), r.config, r.s3Client)
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			recorder.audioTrack = track
 			recorder.audioPublication = publication
@@ -174,17 +271,24 @@ func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication 
 }
 
 func (r *Recorder) HandleTrackUnpublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-	log.Printf("Track unpublished: %s (%s) from participant %s", publication.SID(), publication.Kind(), rp.Identity())
+	roomName, ok := r.participants.Load(rp.Identity())
+	if !ok {
+		log.Printf("Warning: Room not found for participant %s in HandleTrackUnpublished", rp.Identity())
+		return
+	}
+	roomNameStr := roomName.(string)
+	log.Printf("Track unpublished in room %s: %s (%s) from participant %s", roomNameStr, publication.SID(), publication.Kind(), rp.Identity())
 
-	key := rp.Identity()
+	key := fmt.Sprintf("%s-%s", roomNameStr, rp.Identity())
 	if recorder, ok := r.tracks.Load(key); ok {
 		recorder.(*TrackRecorder).Stop()
 		r.tracks.Delete(key)
 	}
 }
 
-func newTrackRecorder(participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client) *TrackRecorder {
+func newTrackRecorder(roomName string, participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client) *TrackRecorder {
 	return &TrackRecorder{
+		roomName:            roomName,
 		participantIdentity: participantIdentity,
 		stopChan:            make(chan struct{}),
 		config:              config,
@@ -194,15 +298,15 @@ func newTrackRecorder(participantIdentity string, config structs.RecorderConfig,
 
 func (tr *TrackRecorder) Start() {
 	if tr.videoTrack == nil {
-		log.Printf("Cannot start recording for participant %s: missing video track", tr.participantIdentity)
+		log.Printf("Cannot start recording for participant %s in room %s: missing video track", tr.participantIdentity, tr.roomName)
 		return
 	}
 
-	log.Printf("Started recording tracks for participant %s", tr.participantIdentity)
+	log.Printf("Started recording tracks for participant %s in room %s", tr.participantIdentity, tr.roomName)
 
 	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
 
-	fileName := fmt.Sprintf("ingress_%s_%s.mp4", tr.participantIdentity, time.Now().Format("20060102_150405"))
+	fileName := fmt.Sprintf("ingress_%s_%s_%s.mp4", tr.roomName, tr.participantIdentity, time.Now().Format("20060102_150405"))
 	s3Key := fmt.Sprintf("livecall/test/%s", fileName)
 
 	expectedS3URL := fmt.Sprintf("https://%s/%s", tr.config.S3Endpoint, s3Key)
@@ -221,7 +325,7 @@ func (tr *TrackRecorder) Start() {
 	}
 
 	req := &livekit.TrackCompositeEgressRequest{
-		RoomName: tr.config.RoomName,
+		RoomName: tr.roomName,
 		Output: &livekit.TrackCompositeEgressRequest_File{
 			File: &livekit.EncodedFileOutput{
 				Filepath: s3Key,
@@ -241,8 +345,8 @@ func (tr *TrackRecorder) Start() {
 		req.VideoTrackId = tr.videoTrack.ID()
 	}
 
-	log.Printf("Starting egress for participant %s. Bucket: %s, Key: %s, Endpoint: %s",
-		tr.participantIdentity, tr.config.S3BucketName, s3Key, tr.config.S3Endpoint)
+	log.Printf("Starting egress for participant %s in room %s. Bucket: %s, Key: %s, Endpoint: %s",
+		tr.participantIdentity, tr.roomName, tr.config.S3BucketName, s3Key, tr.config.S3Endpoint)
 
 	res, err := egressClient.StartTrackCompositeEgress(context.Background(), req)
 	if err != nil {
