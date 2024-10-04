@@ -33,6 +33,7 @@ type Recorder struct {
 	livekitClient *lksdk.RoomServiceClient
 	mu            sync.RWMutex
 }
+
 type TrackRecorder struct {
 	audioTrack          *webrtc.TrackRemote
 	videoTrack          *webrtc.TrackRemote
@@ -108,7 +109,6 @@ func (r *Recorder) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// List all rooms at startup
 	rooms, err := r.livekitClient.ListRooms(ctx, &livekit.ListRoomsRequest{})
 	if err != nil {
 		return fmt.Errorf("failed to list rooms: %v", err)
@@ -116,18 +116,14 @@ func (r *Recorder) Start() error {
 
 	log.Printf("Found %d existing rooms", len(rooms.Rooms))
 
-	// Use a map to keep track of rooms we've already connected to
 	connectedRooms := make(map[string]bool)
 
-	// Connect to all existing rooms
 	for _, room := range rooms.Rooms {
 		if err := r.connectToRoomIfNotConnected(room.Name, connectedRooms); err != nil {
 			log.Printf("Error connecting to room %s: %v", room.Name, err)
-			// Continue with other rooms even if one fails
 		}
 	}
 
-	// Start monitoring for new rooms
 	go r.monitorNewRooms(ctx, connectedRooms)
 
 	sigChan := make(chan os.Signal, 1)
@@ -151,11 +147,14 @@ func (r *Recorder) connectToRoomIfNotConnected(roomName string, connectedRooms m
 
 	log.Printf("Connecting to room: %s", roomName)
 
+	recorderIdentity := fmt.Sprintf("recorder-%s", roomName)
+	r.participants.Store(recorderIdentity, roomName)
+
 	room, err := lksdk.ConnectToRoom(r.config.LiveKitURL, lksdk.ConnectInfo{
 		APIKey:              r.config.APIKey,
 		APISecret:           r.config.APISecret,
 		RoomName:            roomName,
-		ParticipantIdentity: fmt.Sprintf("recorder-%s", roomName),
+		ParticipantIdentity: recorderIdentity,
 		ParticipantName:     fmt.Sprintf("Recorder Bot - %s", roomName),
 	}, &lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
@@ -165,25 +164,36 @@ func (r *Recorder) connectToRoomIfNotConnected(roomName string, connectedRooms m
 		},
 		OnParticipantConnected: func(participant *lksdk.RemoteParticipant) {
 			r.participants.Store(participant.Identity(), roomName)
+			log.Printf("Participant %s connected to room %s", participant.Identity(), roomName)
 		},
 		OnParticipantDisconnected: func(participant *lksdk.RemoteParticipant) {
 			r.participants.Delete(participant.Identity())
+			log.Printf("Participant %s disconnected from room %s", participant.Identity(), roomName)
 		},
 	})
 
 	if err != nil {
+		r.participants.Delete(recorderIdentity)
 		return fmt.Errorf("failed to connect to room %s: %v", roomName, err)
+	}
+
+	// Store information about all participants currently in the room
+	for _, participant := range room.GetParticipants() {
+		r.participants.Store(participant.Identity(), roomName)
+		log.Printf("Stored existing participant %s for room %s", participant.Identity(), roomName)
 	}
 
 	r.rooms[roomName] = room
 	connectedRooms[roomName] = true
 
 	log.Printf("Successfully connected to room: %s", roomName)
+	r.logParticipants() // Log the current state of participants
 	return nil
 }
 
 func (r *Recorder) monitorNewRooms(ctx context.Context, connectedRooms map[string]bool) {
-	ticker := time.NewTicker(30 * time.Second)
+	// 5 second scan if there's a new room
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -196,6 +206,8 @@ func (r *Recorder) monitorNewRooms(ctx context.Context, connectedRooms map[strin
 				log.Printf("Failed to list rooms: %v", err)
 				continue
 			}
+
+			log.Printf("Found %d existing rooms", len(rooms.Rooms))
 
 			for _, room := range rooms.Rooms {
 				if err := r.connectToRoomIfNotConnected(room.Name, connectedRooms); err != nil {
@@ -216,12 +228,27 @@ func (r *Recorder) disconnectAllRooms() {
 }
 
 func (r *Recorder) HandleTrackPublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-	roomName, ok := r.participants.Load(rp.Identity())
+	var roomName interface{}
+	var ok bool
+	for retries := 0; retries < 10; retries++ { // Increased retry count
+		roomName, ok = r.participants.Load(rp.Identity())
+		if ok {
+			break
+		}
+		time.Sleep(200 * time.Millisecond) // Increased sleep time
+	}
 	if !ok {
-		log.Printf("Warning: Room not found for participant %s in HandleTrackPublished", rp.Identity())
+		log.Printf("Warning: Room not found for participant %s in HandleTrackPublished after retries", rp.Identity())
+		r.logParticipants() // Log the current state of participants
 		return
 	}
+
 	log.Printf("Track published in room %s: %s (%s) from participant %s", roomName, publication.SID(), publication.Kind(), rp.Identity())
+
+	if strings.HasPrefix(rp.Identity(), "recorder-") {
+		log.Printf("Skipping subscription for recorder's own track")
+		return
+	}
 
 	err := publication.SetSubscribed(true)
 	if err != nil {
@@ -230,13 +257,28 @@ func (r *Recorder) HandleTrackPublished(publication *lksdk.RemoteTrackPublicatio
 }
 
 func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-	roomName, ok := r.participants.Load(rp.Identity())
+	var roomName interface{}
+	var ok bool
+	for retries := 0; retries < 10; retries++ { // Increased retry count
+		roomName, ok = r.participants.Load(rp.Identity())
+		if ok {
+			break
+		}
+		time.Sleep(200 * time.Millisecond) // Increased sleep time
+	}
 	if !ok {
-		log.Printf("Warning: Room not found for participant %s in HandleTrackSubscribed", rp.Identity())
+		log.Printf("Warning: Room not found for participant %s in HandleTrackSubscribed after retries", rp.Identity())
+		r.logParticipants() // Log the current state of participants
 		return
 	}
+
 	roomNameStr := roomName.(string)
 	log.Printf("Track subscribed in room %s: %s (%s) from participant %s", roomNameStr, publication.SID(), publication.Kind(), rp.Identity())
+
+	if strings.HasPrefix(rp.Identity(), "recorder-") {
+		log.Printf("Skipping processing for recorder's own track")
+		return
+	}
 
 	key := fmt.Sprintf("%s-%s", roomNameStr, rp.Identity())
 	value, loaded := r.tracks.Load(key)
@@ -284,6 +326,14 @@ func (r *Recorder) HandleTrackUnpublished(publication *lksdk.RemoteTrackPublicat
 		recorder.(*TrackRecorder).Stop()
 		r.tracks.Delete(key)
 	}
+}
+
+func (r *Recorder) logParticipants() {
+	log.Println("Current participants:")
+	r.participants.Range(func(key, value interface{}) bool {
+		log.Printf("Participant: %v, Room: %v", key, value)
+		return true
+	})
 }
 
 func newTrackRecorder(roomName string, participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client) *TrackRecorder {

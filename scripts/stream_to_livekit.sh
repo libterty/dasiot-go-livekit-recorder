@@ -46,7 +46,7 @@ method_1() {
     ffmpeg -re -i "$INPUT_FILE" \
         -c:v libx264 -preset veryfast -maxrate 3000k -bufsize 6000k \
         -pix_fmt yuv420p -g 50 -c:a aac -b:a 160k -ac 2 -ar 44100 \
-        -f flv "rtmps://dasiotalbert-jcf2ze7z.rtmp.livekit.cloud/x/2CptNtyBXQr8"
+        -f flv "$RTMP_URL/$STREAM_KEY"
 }
 
 # 方法2：创建LiveKit Ingress
