@@ -152,7 +152,8 @@ func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication 
 			recorder.videoTrack = track
 			recorder.videoPublication = publication
 		}
-		if recorder.audioTrack != nil && recorder.videoTrack != nil {
+		// Start recording if we have at least a video track
+		if recorder.videoTrack != nil {
 			go recorder.Start()
 		}
 	} else {
@@ -165,6 +166,10 @@ func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication 
 			recorder.videoPublication = publication
 		}
 		r.tracks.Store(key, recorder)
+		// Start recording if we have at least a video track
+		if recorder.videoTrack != nil {
+			go recorder.Start()
+		}
 	}
 }
 
@@ -188,8 +193,8 @@ func newTrackRecorder(participantIdentity string, config structs.RecorderConfig,
 }
 
 func (tr *TrackRecorder) Start() {
-	if tr.audioTrack == nil || tr.videoTrack == nil {
-		log.Printf("Cannot start recording for participant %s: missing audio or video track", tr.participantIdentity)
+	if tr.videoTrack == nil {
+		log.Printf("Cannot start recording for participant %s: missing video track", tr.participantIdentity)
 		return
 	}
 
@@ -203,25 +208,37 @@ func (tr *TrackRecorder) Start() {
 	expectedS3URL := fmt.Sprintf("https://%s/%s", tr.config.S3Endpoint, s3Key)
 	log.Printf("Expected S3 URL: %s", expectedS3URL)
 
+	s3Upload := &livekit.S3Upload{
+		AccessKey: tr.config.S3AccessKey,
+		Secret:    tr.config.S3AccessSecret,
+		Bucket:    tr.config.S3BucketName,
+		Endpoint:  tr.config.S3Endpoint,
+		Region:    tr.config.S3Region,
+	}
+
+	if tr.config.S3Region == "minio" {
+		s3Upload.ForcePathStyle = true
+	}
+
 	req := &livekit.TrackCompositeEgressRequest{
-		RoomName:     tr.config.RoomName,
-		AudioTrackId: tr.audioTrack.ID(),
-		VideoTrackId: tr.videoTrack.ID(),
+		RoomName: tr.config.RoomName,
 		Output: &livekit.TrackCompositeEgressRequest_File{
 			File: &livekit.EncodedFileOutput{
 				Filepath: s3Key,
 				Output: &livekit.EncodedFileOutput_S3{
-					S3: &livekit.S3Upload{
-						AccessKey:      tr.config.S3AccessKey,
-						Secret:         tr.config.S3AccessSecret,
-						Bucket:         tr.config.S3BucketName,
-						Endpoint:       tr.config.S3Endpoint,
-						ForcePathStyle: true,
-						Region:         tr.config.S3Region,
-					},
+					S3: s3Upload,
 				},
 			},
 		},
+	}
+
+	// Only include AudioTrackId if we have an audio track
+	if tr.audioTrack != nil {
+		req.AudioTrackId = tr.audioTrack.ID()
+	}
+
+	if tr.videoTrack != nil {
+		req.VideoTrackId = tr.videoTrack.ID()
 	}
 
 	log.Printf("Starting egress for participant %s. Bucket: %s, Key: %s, Endpoint: %s",
