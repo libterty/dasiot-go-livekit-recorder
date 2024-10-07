@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  livekit-recorder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: livekit-recorder
+    container_name: livekit-recorder
+    ports:
+      - "8080:8080"
+    environment:
+      - ENV_FILE=/run/secrets/.env
+    secrets:
+      - source: env_file
+        target: /run/secrets/.env
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 2G
+    command: go run cmd/recorder/main.go
+    working_dir: /app
+
+secrets:
+  env_file:
+    file: ./.env

@@ -8,6 +8,9 @@ GOBIN=$(GOBASE)/bin
 # Main package location
 MAIN_PACKAGE=cmd/recorder/main.go
 
+# Docker Compose file
+DOCKER_COMPOSE_FILE=docker-compose.yml
+
 # Build the project
 build:
 	@echo "Building..."
@@ -46,4 +49,34 @@ build-all:
 	@GOOS=windows GOARCH=amd64 go build -o $(GOBIN)/$(BINARY_NAME)-windows-amd64.exe $(MAIN_PACKAGE)
 	@GOOS=darwin GOARCH=amd64 go build -o $(GOBIN)/$(BINARY_NAME)-darwin-amd64 $(MAIN_PACKAGE)
 
-.PHONY: build run clean deps test dev build-all
+# Docker Compose commands
+
+# Build Docker image
+docker-build:
+	@echo "Building Docker image..."
+	@docker-compose -f $(DOCKER_COMPOSE_FILE) build
+
+# Start Docker containers
+docker-start:
+	@echo "Starting Docker containers..."
+	@docker-compose -f $(DOCKER_COMPOSE_FILE) up -d
+
+# Stop Docker containers
+docker-stop:
+	@echo "Stopping Docker containers..."
+	@docker-compose -f $(DOCKER_COMPOSE_FILE) down
+
+# Build and start Docker containers
+docker-up: docker-build docker-start
+
+# Show Docker container logs
+docker-logs:
+	@echo "Showing Docker container logs..."
+	@docker-compose -f $(DOCKER_COMPOSE_FILE) logs -f
+
+# Remove Docker containers, networks, and volumes
+docker-clean:
+	@echo "Cleaning up Docker resources..."
+	@docker-compose -f $(DOCKER_COMPOSE_FILE) down -v --rmi all --remove-orphans
+
+.PHONY: build run clean deps test dev build-all docker-build docker-start docker-stop docker-up docker-logs docker-clean
