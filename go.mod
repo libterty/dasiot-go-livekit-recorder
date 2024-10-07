@@ -2,6 +2,8 @@ module github.com/dasiot-go-livekit-recorder/livekit-recorder
 
 go 1.21
 
+toolchain go1.23.1
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.31.0
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.37
