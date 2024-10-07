@@ -2,6 +2,7 @@ package recorder
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -44,6 +45,7 @@ type TrackRecorder struct {
 	stopChan            chan struct{}
 	config              structs.RecorderConfig
 	s3Client            *s3.Client
+	recorder            *Recorder
 }
 
 func NewRecorderConfig() (*structs.RecorderConfig, error) {
@@ -186,6 +188,11 @@ func (r *Recorder) connectToRoomIfNotConnected(roomName string, connectedRooms m
 	r.rooms[roomName] = room
 	connectedRooms[roomName] = true
 
+	// Update room metadata to indicate recorder is connected
+	if err := r.updateRoomMetadata(room, true, livekit.EgressStatus_EGRESS_ACTIVE); err != nil {
+		log.Printf("Failed to update room metadata for %s: %v", roomName, err)
+	}
+
 	log.Printf("Successfully connected to room: %s", roomName)
 	r.logParticipants() // Log the current state of participants
 	return nil
@@ -223,8 +230,48 @@ func (r *Recorder) disconnectAllRooms() {
 	defer r.mu.Unlock()
 
 	for _, room := range r.rooms {
+		// Update room metadata to indicate recorder is disconnected
+		if err := r.updateRoomMetadata(room, false, livekit.EgressStatus_EGRESS_ENDING); err != nil {
+			log.Printf("Failed to update room metadata for %s: %v", room.Name(), err)
+		}
 		room.Disconnect()
 	}
+}
+
+// Make sure the updateRoomMetadata method is correctly updating both connection and recording status
+func (r *Recorder) updateRoomMetadata(room *lksdk.Room, isConnected bool, isRecording livekit.EgressStatus) error {
+	ctx := context.Background()
+
+	metadata := room.Metadata()
+
+	if metadata == "" {
+		metadata = "{}"
+	}
+
+	var metadataMap map[string]interface{}
+	if err := json.Unmarshal([]byte(metadata), &metadataMap); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata: %v", err)
+	}
+
+	metadataMap["recorderConnected"] = isConnected
+	metadataMap["recorderStatus"] = getEgressStatusKey(isRecording)
+
+	updatedMetadata, err := json.Marshal(metadataMap)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated metadata: %v", err)
+	}
+
+	// Update room with new metadata
+	_, err = r.livekitClient.UpdateRoomMetadata(ctx, &livekit.UpdateRoomMetadataRequest{
+		Room:     room.Name(),
+		Metadata: string(updatedMetadata),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update room metadata: %v", err)
+	}
+
+	log.Printf("Updated metadata for room %s: recorderConnected = %v, isRecording = %v", room.Name(), isConnected, isRecording)
+	return nil
 }
 
 func (r *Recorder) HandleTrackPublished(publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
@@ -296,7 +343,7 @@ func (r *Recorder) HandleTrackSubscribed(track *webrtc.TrackRemote, publication 
 			go recorder.Start()
 		}
 	} else {
-		recorder := newTrackRecorder(roomNameStr, rp.Identity(), r.config, r.s3Client)
+		recorder := newTrackRecorder(roomNameStr, rp.Identity(), r.config, r.s3Client, r)
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			recorder.audioTrack = track
 			recorder.audioPublication = publication
@@ -323,7 +370,7 @@ func (r *Recorder) HandleTrackUnpublished(publication *lksdk.RemoteTrackPublicat
 
 	key := fmt.Sprintf("%s-%s", roomNameStr, rp.Identity())
 	if recorder, ok := r.tracks.Load(key); ok {
-		recorder.(*TrackRecorder).Stop()
+		recorder.(*TrackRecorder).Stop() // This will update the isRecording status
 		r.tracks.Delete(key)
 	}
 }
@@ -336,14 +383,27 @@ func (r *Recorder) logParticipants() {
 	})
 }
 
-func newTrackRecorder(roomName string, participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client) *TrackRecorder {
+func newTrackRecorder(roomName string, participantIdentity string, config structs.RecorderConfig, s3Client *s3.Client, recorder *Recorder) *TrackRecorder {
 	return &TrackRecorder{
 		roomName:            roomName,
 		participantIdentity: participantIdentity,
 		stopChan:            make(chan struct{}),
 		config:              config,
 		s3Client:            s3Client,
+		recorder:            recorder,
 	}
+}
+
+func (r *Recorder) updateRecordingStatus(roomName string, recordingStatus livekit.EgressStatus) error {
+	r.mu.RLock()
+	room, exists := r.rooms[roomName]
+	r.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("room %s not found", roomName)
+	}
+
+	return r.updateRoomMetadata(room, true, recordingStatus)
 }
 
 func (tr *TrackRecorder) Start() {
@@ -353,6 +413,11 @@ func (tr *TrackRecorder) Start() {
 	}
 
 	log.Printf("Started recording tracks for participant %s in room %s", tr.participantIdentity, tr.roomName)
+
+	// Update room metadata to indicate recording has started
+	if err := tr.recorder.updateRecordingStatus(tr.roomName, livekit.EgressStatus_EGRESS_STARTING); err != nil {
+		log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
+	}
 
 	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
 
@@ -432,6 +497,11 @@ func (tr *TrackRecorder) Start() {
 						// Log CPU and Memory usage
 						tr.logResourceUsage()
 
+						// Update room metadata to indicate recording has started
+						if err := tr.recorder.updateRecordingStatus(tr.roomName, info.Status); err != nil {
+							log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
+						}
+
 						if info.Status == livekit.EgressStatus_EGRESS_COMPLETE {
 							log.Printf("Egress completed successfully for participant %s", tr.participantIdentity)
 							return
@@ -454,7 +524,14 @@ func (tr *TrackRecorder) Start() {
 				// Check if we need to stop the egress based on lastKnownStatus
 				if lastKnownStatus == livekit.EgressStatus_EGRESS_COMPLETE ||
 					lastKnownStatus == livekit.EgressStatus_EGRESS_FAILED ||
-					lastKnownStatus == livekit.EgressStatus_EGRESS_ABORTED {
+					lastKnownStatus == livekit.EgressStatus_EGRESS_ABORTED ||
+					lastKnownStatus == livekit.EgressStatus_EGRESS_LIMIT_REACHED {
+
+					// Update room metadata to indicate recording has started
+					if err := tr.recorder.updateRecordingStatus(tr.roomName, lastKnownStatus); err != nil {
+						log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
+					}
+
 					log.Printf("Stopping egress monitoring for participant %s due to terminal state: %s", tr.participantIdentity, lastKnownStatus)
 					return
 				}
@@ -464,10 +541,15 @@ func (tr *TrackRecorder) Start() {
 				// Attempt to stop the egress if it's still running
 				if lastKnownStatus != livekit.EgressStatus_EGRESS_COMPLETE &&
 					lastKnownStatus != livekit.EgressStatus_EGRESS_FAILED &&
-					lastKnownStatus != livekit.EgressStatus_EGRESS_ABORTED {
+					lastKnownStatus != livekit.EgressStatus_EGRESS_ABORTED &&
+					lastKnownStatus != livekit.EgressStatus_EGRESS_LIMIT_REACHED {
 					_, err := egressClient.StopEgress(context.Background(), &livekit.StopEgressRequest{
 						EgressId: res.EgressId,
 					})
+					// Update room metadata to indicate recording has started
+					if err := tr.recorder.updateRecordingStatus(tr.roomName, lastKnownStatus); err != nil {
+						log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
+					}
 					if err != nil {
 						log.Printf("Failed to stop egress for participant %s: %v", tr.participantIdentity, err)
 					} else {
@@ -504,8 +586,13 @@ func bToMb(b uint64) uint64 {
 }
 
 func (tr *TrackRecorder) Stop() {
-	log.Printf("Stopping recording for participant %s", tr.participantIdentity)
+	log.Printf("Stopping recording for participant %s in room %s", tr.participantIdentity, tr.roomName)
 	close(tr.stopChan)
+
+	// Update room metadata to indicate recording has stopped
+	if err := tr.recorder.updateRecordingStatus(tr.roomName, livekit.EgressStatus_EGRESS_ENDING); err != nil {
+		log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
+	}
 }
 
 func Start() error {
@@ -520,4 +607,25 @@ func Start() error {
 	}
 
 	return recorder.Start()
+}
+
+func getEgressStatusKey(status livekit.EgressStatus) string {
+	switch status {
+	case livekit.EgressStatus_EGRESS_STARTING:
+		return "STARTING"
+	case livekit.EgressStatus_EGRESS_ACTIVE:
+		return "ACTIVE"
+	case livekit.EgressStatus_EGRESS_ENDING:
+		return "ENDING"
+	case livekit.EgressStatus_EGRESS_COMPLETE:
+		return "ACTIVE"
+	case livekit.EgressStatus_EGRESS_FAILED:
+		return "FAILED"
+	case livekit.EgressStatus_EGRESS_ABORTED:
+		return "ABORTED"
+	case livekit.EgressStatus_EGRESS_LIMIT_REACHED:
+		return "LIMIT_REACHED"
+	default:
+		return "UNKNOWN"
+	}
 }
