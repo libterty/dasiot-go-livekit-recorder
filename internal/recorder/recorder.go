@@ -25,6 +25,11 @@ import (
 	"github.com/dasiot-go-livekit-recorder/livekit-recorder/internal/recorder/structs"
 )
 
+const (
+	maxRecordingDuration = 10 * time.Minute
+	overlapDuration      = 10 * time.Second
+)
+
 type Recorder struct {
 	config        structs.RecorderConfig
 	rooms         map[string]*lksdk.Room
@@ -46,6 +51,11 @@ type TrackRecorder struct {
 	config              structs.RecorderConfig
 	s3Client            *s3.Client
 	recorder            *Recorder
+	currentEgressID     string
+	nextEgressID        string
+	recordingStartTime  time.Time
+	recordingTimer      *time.Timer
+	overlapTimer        *time.Timer
 }
 
 func NewRecorderConfig() (*structs.RecorderConfig, error) {
@@ -412,6 +422,10 @@ func (tr *TrackRecorder) Start() {
 		return
 	}
 
+	tr.startRecording(false)
+}
+
+func (tr *TrackRecorder) startRecording(isOverlapping bool) {
 	log.Printf("Started recording tracks for participant %s in room %s", tr.participantIdentity, tr.roomName)
 
 	// Update room metadata to indicate recording has started
@@ -419,13 +433,12 @@ func (tr *TrackRecorder) Start() {
 		log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
 	}
 
-	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
-
-	fileName := fmt.Sprintf("ingress_%s_%s_%s.mp4", tr.roomName, tr.participantIdentity, time.Now().Format("20060102_150405"))
-	s3Key := fmt.Sprintf("livecall/test/%s", fileName)
+	s3Key := fmt.Sprintf("livecall/test/%s/%s/ingress_%s", tr.roomName, tr.participantIdentity, time.Now().Format("20060102_150405"))
 
 	expectedS3URL := fmt.Sprintf("https://%s/%s", tr.config.S3Endpoint, s3Key)
 	log.Printf("Expected S3 URL: %s", expectedS3URL)
+
+	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
 
 	s3Upload := &livekit.S3Upload{
 		AccessKey: tr.config.S3AccessKey,
@@ -451,7 +464,6 @@ func (tr *TrackRecorder) Start() {
 		},
 	}
 
-	// Only include AudioTrackId if we have an audio track
 	if tr.audioTrack != nil {
 		req.AudioTrackId = tr.audioTrack.ID()
 	}
@@ -466,100 +478,131 @@ func (tr *TrackRecorder) Start() {
 	res, err := egressClient.StartTrackCompositeEgress(context.Background(), req)
 	if err != nil {
 		log.Printf("Failed to start egress for participant %s: %v", tr.participantIdentity, err)
+		if isOverlapping {
+			time.AfterFunc(5*time.Second, func() { tr.startRecording(true) })
+		}
 		return
 	}
 
-	log.Printf("Egress started successfully for participant %s. EgressID: %s", tr.participantIdentity, res.EgressId)
+	egressID := res.EgressId
+	log.Printf("Egress started successfully for participant %s. EgressID: %s", tr.participantIdentity, egressID)
 
-	var lastKnownStatus livekit.EgressStatus
+	if isOverlapping {
+		tr.nextEgressID = egressID
+		tr.overlapTimer = time.AfterFunc(overlapDuration, tr.switchToNextEgress)
+	} else {
+		tr.currentEgressID = egressID
+		tr.recordingStartTime = time.Now()
+		tr.startRecordingTimer()
+	}
 
-	// Start Egress status monitoring
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+	go tr.monitorEgressStatus(egressID)
+}
 
-		for {
-			select {
-			case <-ticker.C:
-				listRes, err := egressClient.ListEgress(context.Background(), &livekit.ListEgressRequest{
-					RoomName: tr.config.RoomName,
-				})
-				if err != nil {
-					log.Printf("Error listing egress for participant %s: %v", tr.participantIdentity, err)
-					continue
-				}
+func (tr *TrackRecorder) monitorEgressStatus(egressID string) {
+	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
-				for _, info := range listRes.Items {
-					if info.EgressId == res.EgressId {
-						lastKnownStatus = info.Status
-						log.Printf("Egress status for participant %s: %s", tr.participantIdentity, info.Status)
-
-						// Log CPU and Memory usage
-						tr.logResourceUsage()
-
-						// Update room metadata to indicate recording has started
-						if err := tr.recorder.updateRecordingStatus(tr.roomName, info.Status); err != nil {
-							log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
-						}
-
-						if info.Status == livekit.EgressStatus_EGRESS_COMPLETE {
-							log.Printf("Egress completed successfully for participant %s", tr.participantIdentity)
-							return
-						} else if info.Status == livekit.EgressStatus_EGRESS_FAILED {
-							log.Printf("Egress failed for participant %s. Error: %s", tr.participantIdentity, info.Error)
-							if strings.Contains(info.Error, "AccessDenied") {
-								log.Printf("S3 access denied. Please check your credentials and bucket permissions.")
-							} else if strings.Contains(info.Error, "NoSuchBucket") {
-								log.Printf("S3 bucket not found. Please check if the bucket '%s' exists.", tr.config.S3BucketName)
-							}
-							return
-						} else if info.Status == livekit.EgressStatus_EGRESS_ABORTED {
-							log.Printf("Egress aborted for participant %s", tr.participantIdentity)
-							return
-						}
-						break
-					}
-				}
-
-				// Check if we need to stop the egress based on lastKnownStatus
-				if lastKnownStatus == livekit.EgressStatus_EGRESS_COMPLETE ||
-					lastKnownStatus == livekit.EgressStatus_EGRESS_FAILED ||
-					lastKnownStatus == livekit.EgressStatus_EGRESS_ABORTED ||
-					lastKnownStatus == livekit.EgressStatus_EGRESS_LIMIT_REACHED {
-
-					// Update room metadata to indicate recording has started
-					if err := tr.recorder.updateRecordingStatus(tr.roomName, lastKnownStatus); err != nil {
-						log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
-					}
-
-					log.Printf("Stopping egress monitoring for participant %s due to terminal state: %s", tr.participantIdentity, lastKnownStatus)
-					return
-				}
-
-			case <-tr.stopChan:
-				log.Printf("Stop signal received for egress status monitoring of participant %s", tr.participantIdentity)
-				// Attempt to stop the egress if it's still running
-				if lastKnownStatus != livekit.EgressStatus_EGRESS_COMPLETE &&
-					lastKnownStatus != livekit.EgressStatus_EGRESS_FAILED &&
-					lastKnownStatus != livekit.EgressStatus_EGRESS_ABORTED &&
-					lastKnownStatus != livekit.EgressStatus_EGRESS_LIMIT_REACHED {
-					_, err := egressClient.StopEgress(context.Background(), &livekit.StopEgressRequest{
-						EgressId: res.EgressId,
-					})
-					// Update room metadata to indicate recording has started
-					if err := tr.recorder.updateRecordingStatus(tr.roomName, lastKnownStatus); err != nil {
-						log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
-					}
-					if err != nil {
-						log.Printf("Failed to stop egress for participant %s: %v", tr.participantIdentity, err)
-					} else {
-						log.Printf("Successfully stopped egress for participant %s", tr.participantIdentity)
-					}
-				}
-				return
+	for {
+		select {
+		case <-ticker.C:
+			listRes, err := egressClient.ListEgress(context.Background(), &livekit.ListEgressRequest{
+				RoomName: tr.roomName,
+			})
+			if err != nil {
+				log.Printf("Error listing egress for participant %s: %v", tr.participantIdentity, err)
+				continue
 			}
+
+			for _, info := range listRes.Items {
+				if info.EgressId == egressID {
+					log.Printf("Egress status for participant %s: %s", tr.participantIdentity, info.Status)
+
+					tr.logResourceUsage()
+
+					if err := tr.recorder.updateRecordingStatus(tr.roomName, info.Status); err != nil {
+						log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
+					}
+
+					switch info.Status {
+					case livekit.EgressStatus_EGRESS_COMPLETE:
+						log.Printf("Egress completed successfully for participant %s", tr.participantIdentity)
+						tr.handleEgressCompletion(egressID)
+						return
+					case livekit.EgressStatus_EGRESS_FAILED:
+						log.Printf("Egress failed for participant %s. Error: %s", tr.participantIdentity, info.Error)
+						tr.handleEgressFailure(egressID)
+						return
+					case livekit.EgressStatus_EGRESS_ABORTED:
+						log.Printf("Egress aborted for participant %s", tr.participantIdentity)
+						tr.handleEgressFailure(egressID)
+						return
+					}
+					break
+				}
+			}
+		case <-tr.stopChan:
+			log.Printf("Stop signal received for egress status monitoring of participant %s", tr.participantIdentity)
+			return
 		}
-	}()
+	}
+}
+
+func (tr *TrackRecorder) handleEgressCompletion(completedEgressID string) {
+	if completedEgressID == tr.currentEgressID && tr.nextEgressID == "" {
+		// If the current egress completed and there's no next egress, start a new recording
+		tr.currentEgressID = ""
+		tr.startRecording(false)
+	}
+}
+
+func (tr *TrackRecorder) handleEgressFailure(failedEgressID string) {
+	if failedEgressID == tr.currentEgressID {
+		// If the current egress failed, start a new one immediately
+		tr.currentEgressID = ""
+		tr.startRecording(false)
+	} else if failedEgressID == tr.nextEgressID {
+		// If the next (overlapping) egress failed, clear the timer and try again
+		tr.nextEgressID = ""
+		if tr.overlapTimer != nil {
+			tr.overlapTimer.Stop()
+			tr.overlapTimer = nil
+		}
+		tr.startRecording(true)
+	}
+}
+
+func (tr *TrackRecorder) startRecordingTimer() {
+	if tr.recordingTimer != nil {
+		tr.recordingTimer.Stop()
+	}
+	tr.recordingTimer = time.AfterFunc(maxRecordingDuration-overlapDuration, func() {
+		log.Printf("Preparing to start new egress for participant %s in room %s", tr.participantIdentity, tr.roomName)
+		tr.startRecording(true) // Start overlapping recording
+	})
+}
+
+func (tr *TrackRecorder) switchToNextEgress() {
+	if tr.currentEgressID != "" {
+		egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
+		_, err := egressClient.StopEgress(context.Background(), &livekit.StopEgressRequest{
+			EgressId: tr.currentEgressID,
+		})
+		if err != nil {
+			log.Printf("Failed to stop current egress for participant %s: %v", tr.participantIdentity, err)
+		} else {
+			log.Printf("Stopped current egress for participant %s. EgressID: %s", tr.participantIdentity, tr.currentEgressID)
+		}
+	}
+
+	// Switch to the next egress
+	tr.currentEgressID = tr.nextEgressID
+	tr.nextEgressID = ""
+	tr.recordingStartTime = time.Now()
+
+	// Start the timer for the next overlap
+	tr.startRecordingTimer()
 }
 
 func (tr *TrackRecorder) logResourceUsage() {
@@ -588,11 +631,47 @@ func bToMb(b uint64) uint64 {
 func (tr *TrackRecorder) Stop() {
 	log.Printf("Stopping recording for participant %s in room %s", tr.participantIdentity, tr.roomName)
 	close(tr.stopChan)
+	if tr.recordingTimer != nil {
+		tr.recordingTimer.Stop()
+	}
+	if tr.overlapTimer != nil {
+		tr.overlapTimer.Stop()
+	}
+	tr.stopAllEgress()
 
-	// Update room metadata to indicate recording has stopped
 	if err := tr.recorder.updateRecordingStatus(tr.roomName, livekit.EgressStatus_EGRESS_ENDING); err != nil {
 		log.Printf("Failed to update recording status for room %s: %v", tr.roomName, err)
 	}
+}
+
+func (tr *TrackRecorder) stopAllEgress() {
+	egressClient := lksdk.NewEgressClient(tr.config.LiveKitURL, tr.config.APIKey, tr.config.APISecret)
+
+	if tr.currentEgressID != "" {
+		_, err := egressClient.StopEgress(context.Background(), &livekit.StopEgressRequest{
+			EgressId: tr.currentEgressID,
+		})
+		if err != nil {
+			log.Printf("Failed to stop current egress for participant %s: %v", tr.participantIdentity, err)
+		} else {
+			log.Printf("Stopped current egress for participant %s. EgressID: %s", tr.participantIdentity, tr.currentEgressID)
+		}
+	}
+
+	if tr.nextEgressID != "" {
+		_, err := egressClient.StopEgress(context.Background(), &livekit.StopEgressRequest{
+			EgressId: tr.nextEgressID,
+		})
+		if err != nil {
+			log.Printf("Failed to stop next egress for participant %s: %v", tr.participantIdentity, err)
+		} else {
+			log.Printf("Stopped next egress for participant %s. EgressID: %s", tr.participantIdentity, tr.nextEgressID)
+		}
+	}
+
+	// Clear egress IDs
+	tr.currentEgressID = ""
+	tr.nextEgressID = ""
 }
 
 func Start() error {
